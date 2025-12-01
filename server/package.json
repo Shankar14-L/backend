@@ -3,6 +3,7 @@
   "version": "1.0.0",
   "private": true,
   "dependencies": {
-    "ethers": "^6.9.0"
+    "ethers": "^6.9.0",
+    "dotenv": "^16.3.1"
   }
 }
