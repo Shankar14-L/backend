@@ -63,6 +63,15 @@ const CONTRACT_ABI = [
  */
 async function getContract() {
     try {
+        // helpful debug about ethers shape/version
+        try {
+            // some versions expose `version`, others may expose util info
+            const ev = (ethers && (ethers.version || (ethers.utils && ethers.utils.version))) || 'unknown';
+            console.error("NODE: ethers version/identifier:", ev);
+        } catch (e) {
+            console.error("NODE: unable to read ethers.version:", e && e.message ? e.message : e);
+        }
+
         // Determine contract address (priority: sanitized env -> CONFIG -> deployment.json)
         let contractAddress = EFFECTIVE_CONTRACT_ADDR || CONFIG.CONTRACT_ADDRESS;
 
@@ -83,22 +92,50 @@ async function getContract() {
             throw new Error('Contract address not found. Please set CONTRACT_ADDRESS env or provide deployment.json.');
         }
 
-        // Setup provider and signer/wallet
-        const provider = new ethers.providers.JsonRpcProvider(CONFIG.RPC_URL);
-        const wallet = new ethers.Wallet(CONFIG.PRIVATE_KEY, provider);
+        // Create provider in a way that works for both ethers v5 and v6 (and other shapes)
+        let provider;
+        try {
+            if (ethers && ethers.providers && ethers.providers.JsonRpcProvider) {
+                console.error("NODE: using ethers.providers.JsonRpcProvider (v5 style)");
+                provider = new ethers.providers.JsonRpcProvider(CONFIG.RPC_URL);
+            } else if (ethers && ethers.JsonRpcProvider) {
+                console.error("NODE: using ethers.JsonRpcProvider (v6/top-level style)");
+                provider = new ethers.JsonRpcProvider(CONFIG.RPC_URL);
+            } else if (ethers && typeof ethers.getDefaultProvider === 'function') {
+                console.error("NODE: using ethers.getDefaultProvider as fallback");
+                // getDefaultProvider accepts a network or options; passing RPC_URL will attempt to use it as a network param,
+                // but it's the best effort fallback — many environments will have v5/v6 providers available.
+                provider = ethers.getDefaultProvider(CONFIG.RPC_URL);
+            } else {
+                throw new Error('No usable JsonRpcProvider found on ethers import.');
+            }
+        } catch (provErr) {
+            console.error("NODE: provider construction failed:", provErr && provErr.message ? provErr.message : provErr);
+            throw provErr;
+        }
+
+        // Wallet construction — v5 and v6 both support new ethers.Wallet(privateKey, provider)
+        let wallet;
+        try {
+            wallet = new ethers.Wallet(CONFIG.PRIVATE_KEY, provider);
+        } catch (wErr) {
+            console.error("NODE: wallet construction failed:", wErr && wErr.message ? wErr.message : wErr);
+            throw wErr;
+        }
 
         console.error("NODE: provider ready, wallet address:", wallet.address);
 
-        // Create contract instance connected to wallet (so tx sending is simple)
+        // Create contract instance connected to wallet
         const contract = new ethers.Contract(contractAddress, CONTRACT_ABI, wallet);
-        // defensive check
         if (!contract || typeof contract.createSession !== 'function') {
-            throw new Error('Contract instance invalid or missing methods. Check ABI and contract address.');
+            // defensive message with ABI shape details
+            console.error("NODE: contract instance missing createSession method — check ABI and address.");
+            throw new Error('Contract instance invalid or missing expected methods. Check ABI and contract address.');
         }
 
         return { contract, provider, wallet };
     } catch (error) {
-        // rethrow with context
+        // rethrow with context (this will be caught in main())
         throw new Error(`Failed to initialize contract: ${error && error.message ? error.message : error}`);
     }
 }
