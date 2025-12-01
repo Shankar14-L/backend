@@ -1,0 +1,8 @@
+{
+  "name": "backend-node-helper",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "ethers": "^6.9.0"
+  }
+}
