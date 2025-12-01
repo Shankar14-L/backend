@@ -153,16 +153,15 @@ async function createSession(payload) {
         { gasLimit: CONFIG.GAS_LIMIT }
     );
     
-    const receipt = await tx.wait();
-    
-    return {
-        success: true,
-        txHash: receipt.hash,
-        blockNumber: receipt.blockNumber,
-        sessionCode,
-        classId
-    };
-}
+    const tx = await contract.createSession(sessionCode, classId, durationMinutes, { gasLimit: CONFIG.GAS_LIMIT });
+// immediately return tx hash — do not wait for mining
+return {
+  success: true,
+  txHash: tx.hash,
+  sessionCode,
+  classId,
+  message: "Transaction submitted — returned immediately. Confirmations may arrive later."
+};
 
 /**
  * Mark attendance
