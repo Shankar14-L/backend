@@ -1,0 +1,517 @@
+from fastapi import FastAPI, APIRouter, HTTPException, Depends, status
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from dotenv import load_dotenv
+from starlette.middleware.cors import CORSMiddleware
+from motor.motor_asyncio import AsyncIOMotorClient
+import os
+import logging
+from pathlib import Path
+from pydantic import BaseModel, Field, EmailStr
+from typing import List, Optional
+import uuid
+from datetime import datetime, timedelta, timezone
+import jwt
+import hashlib
+import json
+import qrcode
+import io
+import base64
+from passlib.context import CryptContext
+import secrets
+from dotenv import load_dotenv
+import os
+
+# Load .env file
+load_dotenv()
+
+ROOT_DIR = Path(__file__).parent
+load_dotenv(ROOT_DIR / '.env')
+
+# MongoDB connection
+# Make sure your .env has:
+# MONGO_URL="mongodb+srv://Shankar:Shankar%401234@cluster1.xzhaxdf.mongodb.net/attandance?retryWrites=true&w=majority"
+# DB_NAME="attandance"
+mongo_url = os.environ.get('MONGO_URL')
+if not mongo_url:
+    raise ValueError("MONGO_URL is not set in the environment variables or .env file")
+client = AsyncIOMotorClient(mongo_url)
+db = client[os.environ.get('DB_NAME', 'blockchain_attendance')]
+
+# Security
+security = HTTPBearer()
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+SECRET_KEY = os.environ.get('SECRET_KEY', 'your-secret-key-here')
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 30
+
+# Create the main app
+app = FastAPI(title="Blockchain QR Attendance System")
+api_router = APIRouter(prefix="/api")
+
+# Models
+class User(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    name: str
+    email: EmailStr
+    role: str  # "teacher" or "student"
+    wallet_address: Optional[str] = None
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+class UserCreate(BaseModel):
+    name: str
+    email: EmailStr
+    password: str
+    role: str
+
+class UserLogin(BaseModel):
+    email: EmailStr
+    password: str
+
+class Class(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    name: str
+    description: str
+    course_code: str
+    teacher_id: str
+    teacher_name: str
+    students_enrolled: List[str] = []
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    is_active: bool = True
+
+class ClassCreate(BaseModel):
+    name: str
+    description: str
+
+class AttendanceRecord(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    student_id: str
+    student_name: str
+    class_id: str
+    class_name: str
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    blockchain_hash: str
+    qr_code_id: str
+    verified: bool = True
+
+class QRCode(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    class_id: str
+    teacher_id: str
+    expires_at: datetime
+    is_active: bool = True
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+class BlockchainBlock(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    block_number: int
+    previous_hash: str
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    data: dict
+    hash: str
+    nonce: int = 0
+
+# Helper functions
+def hash_password(password: str) -> str:
+    return pwd_context.hash(password)
+
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    return pwd_context.verify(plain_password, hashed_password)
+
+def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
+    to_encode = data.copy()
+    if expires_delta:
+        expire = datetime.now(timezone.utc) + expires_delta
+    else:
+        expire = datetime.now(timezone.utc) + timedelta(minutes=15)
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return encoded_jwt
+
+def generate_course_code():
+    return 'CS' + ''.join(secrets.choice('0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ') for _ in range(4))
+
+def calculate_hash(data: str) -> str:
+    return hashlib.sha256(data.encode()).hexdigest()
+
+def create_blockchain_block(data: dict, previous_hash: str = "0") -> dict:
+    block_data = {
+        "data": data,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "previous_hash": previous_hash
+    }
+    block_string = json.dumps(block_data, sort_keys=True)
+    block_hash = calculate_hash(block_string)
+    
+    return {
+        "hash": block_hash,
+        "previous_hash": previous_hash,
+        "timestamp": datetime.now(timezone.utc),
+        "data": data,
+        "nonce": secrets.randbelow(1000000)
+    }
+
+def generate_qr_code(data: str) -> str:
+    qr = qrcode.QRCode(version=1, box_size=10, border=5)
+    qr.add_data(data)
+    qr.make(fit=True)
+    
+    img = qr.make_image(fill_color="black", back_color="white")
+    buffer = io.BytesIO()
+    img.save(buffer, format='PNG')
+    buffer.seek(0)
+    
+    return base64.b64encode(buffer.getvalue()).decode()
+
+async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    try:
+        payload = jwt.decode(credentials.credentials, SECRET_KEY, algorithms=[ALGORITHM])
+        email: str = payload.get("sub")
+        if email is None:
+            raise HTTPException(status_code=401, detail="Invalid token")
+        
+        user = await db.users.find_one({"email": email})
+        if user is None:
+            raise HTTPException(status_code=401, detail="User not found")
+        
+        return User(**user)
+    except jwt.PyJWTError:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+# Authentication Routes
+@api_router.post("/auth/register")
+async def register_user(user: UserCreate):
+    # Check if user exists
+    existing_user = await db.users.find_one({"email": user.email})
+    if existing_user:
+        raise HTTPException(status_code=400, detail="Email already registered")
+    
+    # Hash password
+    hashed_password = hash_password(user.password)
+    
+    # Create user
+    user_dict = user.dict()
+    user_dict['password'] = hashed_password
+    user_dict['id'] = str(uuid.uuid4())
+    user_dict['created_at'] = datetime.now(timezone.utc)
+    user_dict['wallet_address'] = f"0x{secrets.token_hex(20)}"  # Mock wallet address
+    
+    await db.users.insert_one(user_dict)
+    
+    # Create token
+    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = create_access_token(
+        data={"sub": user.email}, expires_delta=access_token_expires
+    )
+    
+    return {
+        "access_token": access_token,
+        "token_type": "bearer",
+        "user": User(**user_dict)
+    }
+
+@api_router.post("/auth/login")
+async def login_user(user_login: UserLogin):
+    user = await db.users.find_one({"email": user_login.email})
+    if not user or not verify_password(user_login.password, user['password']):
+        raise HTTPException(status_code=401, detail="Incorrect email or password")
+    
+    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = create_access_token(
+        data={"sub": user_login.email}, expires_delta=access_token_expires
+    )
+    
+    return {
+        "access_token": access_token,
+        "token_type": "bearer",
+        "user": User(**user)
+    }
+
+# Class Management Routes
+@api_router.get("/classes", response_model=List[Class])
+async def get_classes(current_user: User = Depends(get_current_user)):
+    if current_user.role == "teacher":
+        classes = await db.classes.find({"teacher_id": current_user.id}).to_list(100)
+    else:
+        classes = await db.classes.find({"students_enrolled": current_user.id}).to_list(100)
+    
+    return [Class(**cls) for cls in classes]
+
+@api_router.post("/classes", response_model=Class)
+async def create_class(class_data: ClassCreate, current_user: User = Depends(get_current_user)):
+    if current_user.role != "teacher":
+        raise HTTPException(status_code=403, detail="Only teachers can create classes")
+    
+    class_dict = class_data.dict()
+    class_dict['id'] = str(uuid.uuid4())
+    class_dict['teacher_id'] = current_user.id
+    class_dict['teacher_name'] = current_user.name
+    class_dict['course_code'] = generate_course_code()
+    class_dict['created_at'] = datetime.now(timezone.utc)
+    class_dict['is_active'] = True
+    class_dict['students_enrolled'] = []
+    
+    await db.classes.insert_one(class_dict)
+    
+    # Create blockchain record
+    blockchain_data = {
+        "action": "class_created",
+        "class_id": class_dict['id'],
+        "teacher_id": current_user.id,
+        "timestamp": datetime.now(timezone.utc).isoformat()
+    }
+    
+    # Get last block
+    last_block = await db.blockchain.find().sort("block_number", -1).limit(1).to_list(1)
+    previous_hash = last_block[0]['hash'] if last_block else "0"
+    
+    block = create_blockchain_block(blockchain_data, previous_hash)
+    block['block_number'] = len(last_block) + 1 if last_block else 1
+    block['id'] = str(uuid.uuid4())
+    
+    await db.blockchain.insert_one(block)
+    
+    return Class(**class_dict)
+
+@api_router.get("/classes/{class_id}")
+async def get_class_details(class_id: str, current_user: User = Depends(get_current_user)):
+    class_data = await db.classes.find_one({"id": class_id})
+    if not class_data:
+        raise HTTPException(status_code=404, detail="Class not found")
+    
+    # Check access permissions
+    if current_user.role == "teacher" and class_data['teacher_id'] != current_user.id:
+        raise HTTPException(status_code=403, detail="Access denied")
+    elif current_user.role == "student" and current_user.id not in class_data.get('students_enrolled', []):
+        raise HTTPException(status_code=403, detail="Access denied")
+    
+    # Get attendance records for this class
+    attendance_records = await db.attendance.find({"class_id": class_id}).to_list(1000)
+    
+    return {
+        "class": Class(**class_data),
+        "attendance_records": [AttendanceRecord(**record) for record in attendance_records]
+    }
+
+@api_router.post("/classes/{class_id}/generate-qr")
+async def generate_attendance_qr(class_id: str, current_user: User = Depends(get_current_user)):
+    if current_user.role != "teacher":
+        raise HTTPException(status_code=403, detail="Only teachers can generate QR codes")
+    
+    class_data = await db.classes.find_one({"id": class_id, "teacher_id": current_user.id})
+    if not class_data:
+        raise HTTPException(status_code=404, detail="Class not found")
+    
+    # Create QR code record
+    qr_id = str(uuid.uuid4())
+    expires_at = datetime.now(timezone.utc) + timedelta(minutes=30)  # QR expires in 30 minutes
+    
+    qr_data = {
+        "id": qr_id,
+        "class_id": class_id,
+        "teacher_id": current_user.id,
+        "expires_at": expires_at,
+        "is_active": True,
+        "created_at": datetime.now(timezone.utc)
+    }
+    
+    await db.qr_codes.insert_one(qr_data)
+    
+    # Generate QR code image
+    qr_content = f"{class_id}:{qr_id}:{expires_at.isoformat()}"
+    qr_image = generate_qr_code(qr_content)
+    
+    return {
+        "qr_code": qr_image,
+        "qr_id": qr_id,
+        "expires_at": expires_at,
+        "class_name": class_data['name']
+    }
+
+@api_router.post("/attendance/mark")
+async def mark_attendance(qr_data: dict, current_user: User = Depends(get_current_user)):
+    if current_user.role != "student":
+        raise HTTPException(status_code=403, detail="Only students can mark attendance")
+    
+    qr_content = qr_data.get('qr_content')
+    if not qr_content:
+        raise HTTPException(status_code=400, detail="QR content required")
+    
+    try:
+        class_id, qr_id, expires_str = qr_content.split(':')
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid QR code format")
+    
+    # Verify QR code
+    qr_record = await db.qr_codes.find_one({"id": qr_id, "is_active": True})
+    if not qr_record:
+        raise HTTPException(status_code=400, detail="Invalid or expired QR code")
+    
+    # Check expiration
+    if datetime.now(timezone.utc) > qr_record['expires_at']:
+        raise HTTPException(status_code=400, detail="QR code has expired")
+    
+    # Check if already marked
+    existing_attendance = await db.attendance.find_one({
+        "student_id": current_user.id,
+        "class_id": class_id,
+        "qr_code_id": qr_id
+    })
+    
+    if existing_attendance:
+        raise HTTPException(status_code=400, detail="Attendance already marked for this session")
+    
+    # Get class info
+    class_data = await db.classes.find_one({"id": class_id})
+    if not class_data:
+        raise HTTPException(status_code=404, detail="Class not found")
+    
+    # Enroll student if not already enrolled
+    if current_user.id not in class_data.get('students_enrolled', []):
+        await db.classes.update_one(
+            {"id": class_id},
+            {"$push": {"students_enrolled": current_user.id}}
+        )
+    
+    # Create attendance record
+    attendance_data = {
+        "student_id": current_user.id,
+        "student_name": current_user.name,
+        "class_id": class_id,
+        "class_name": class_data['name'],
+        "qr_code_id": qr_id,
+        "timestamp": datetime.now(timezone.utc),
+        "verified": True
+    }
+    
+    # Create blockchain hash
+    blockchain_data = {
+        "action": "attendance_marked",
+        "student_id": current_user.id,
+        "class_id": class_id,
+        "timestamp": datetime.now(timezone.utc).isoformat()
+    }
+    
+    # Get last block
+    last_block = await db.blockchain.find().sort("block_number", -1).limit(1).to_list(1)
+    previous_hash = last_block[0]['hash'] if last_block else "0"
+    
+    block = create_blockchain_block(blockchain_data, previous_hash)
+    attendance_data['blockchain_hash'] = block['hash']
+    attendance_data['id'] = str(uuid.uuid4())
+    
+    # Save to blockchain
+    block['block_number'] = len(last_block) + 1 if last_block else 1
+    block['id'] = str(uuid.uuid4())
+    await db.blockchain.insert_one(block)
+    
+    # Save attendance record
+    await db.attendance.insert_one(attendance_data)
+    
+    return {
+        "message": "Attendance marked successfully",
+        "blockchain_hash": attendance_data['blockchain_hash'],
+        "timestamp": attendance_data['timestamp']
+    }
+
+@api_router.get("/attendance/my", response_model=List[AttendanceRecord])
+async def get_my_attendance(current_user: User = Depends(get_current_user)):
+    if current_user.role != "student":
+        raise HTTPException(status_code=403, detail="Only students can view their attendance")
+    
+    attendance_records = await db.attendance.find({"student_id": current_user.id}).to_list(1000)
+    return [AttendanceRecord(**record) for record in attendance_records]
+
+@api_router.get("/blockchain/verify/{block_hash}")
+async def verify_blockchain_record(block_hash: str):
+    block = await db.blockchain.find_one({"hash": block_hash})
+    if not block:
+        raise HTTPException(status_code=404, detail="Block not found")
+    
+    # Verify block integrity
+    block_data = {
+        "data": block['data'],
+        "timestamp": block['timestamp'].isoformat() if isinstance(block['timestamp'], datetime) else block['timestamp'],
+        "previous_hash": block['previous_hash']
+    }
+    block_string = json.dumps(block_data, sort_keys=True)
+    calculated_hash = calculate_hash(block_string)
+    
+    is_valid = calculated_hash == block['hash']
+    
+    return {
+        "block": block,
+        "is_valid": is_valid,
+        "calculated_hash": calculated_hash
+    }
+
+@api_router.get("/dashboard/stats")
+async def get_dashboard_stats(current_user: User = Depends(get_current_user)):
+    if current_user.role == "teacher":
+        # Teacher stats
+        total_classes = await db.classes.count_documents({"teacher_id": current_user.id})
+        total_students = await db.classes.aggregate([
+            {"$match": {"teacher_id": current_user.id}},
+            {"$project": {"students_count": {"$size": "$students_enrolled"}}},
+            {"$group": {"_id": None, "total": {"$sum": "$students_count"}}}
+        ]).to_list(1)
+        
+        recent_attendance = await db.attendance.find({
+            "class_id": {"$in": await get_teacher_class_ids(current_user.id)}
+        }).sort("timestamp", -1).limit(10).to_list(10)
+        
+        return {
+            "total_classes": total_classes,
+            "total_students": total_students[0]['total'] if total_students else 0,
+            "recent_attendance": [AttendanceRecord(**record) for record in recent_attendance]
+        }
+    else:
+        # Student stats
+        total_attendance = await db.attendance.count_documents({"student_id": current_user.id})
+        enrolled_classes = await db.classes.count_documents({"students_enrolled": current_user.id})
+        
+        recent_attendance = await db.attendance.find({
+            "student_id": current_user.id
+        }).sort("timestamp", -1).limit(10).to_list(10)
+        
+        return {
+            "total_attendance": total_attendance,
+            "enrolled_classes": enrolled_classes,
+            "recent_attendance": [AttendanceRecord(**record) for record in recent_attendance]
+        }
+
+async def get_teacher_class_ids(teacher_id: str):
+    classes = await db.classes.find({"teacher_id": teacher_id}).to_list(1000)
+    return [cls['id'] for cls in classes]
+
+# Include the router in the main app
+app.include_router(api_router)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_credentials=True,
+    allow_origins=os.environ.get('CORS_ORIGINS', '*').split(','),
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+from contextlib import asynccontextmanager
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup: nothing to do here
+    yield
+    # Shutdown
+    client.close()
+
+app = FastAPI(title="Blockchain QR Attendance System", lifespan=lifespan)
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("server:app", host="0.0.0.0", port=5000, reload=True)
+
