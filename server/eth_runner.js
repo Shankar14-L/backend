@@ -5,89 +5,45 @@
  * Handles blockchain interactions for the attendance system
  * Usage: node eth_runner.js <action> <json_payload>
  *
- * NOTE: diagnostics/logs are intentionally written to stderr so callers (like Python)
- * can safely parse JSON printed to stdout.
+ * Changes made:
+ * - Use CONFIG.RPC_URL everywhere (avoid mixing SEPOLIA_RPC_URL).
+ * - Delay creating provider/wallet until getContract() to avoid undefined providers.
+ * - Add defensive checks and try/catch around on-chain operations.
+ * - Diagnostics on stderr; final JSON on stdout (so callers can json.loads safely).
  */
 
 const { ethers } = require('ethers');
 const fs = require('fs');
 const path = require('path');
 require("dotenv").config();
+
 // Configuration
 const CONFIG = {
-    RPC_URL: process.env.ETH_RPC_URL || 'http://127.0.0.1:8545', // Local Hardhat/Ganache
+    RPC_URL: process.env.ETH_RPC_URL || process.env.RPC_URL || 'http://127.0.0.1:8545', // primary RPC
     PRIVATE_KEY: process.env.PRIVATE_KEY || '0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80', // Hardhat default
     CONTRACT_ADDRESS: process.env.CONTRACT_ADDRESS || null,
-    GAS_LIMIT: process.env.GAS_LIMIT || 7000000
+    GAS_LIMIT: process.env.GAS_LIMIT ? Number(process.env.GAS_LIMIT) : 7000000
 };
-// === BEGIN: robust eth_runner helper ===
 
+// helper: sanitize address strings from weird env formatting
 function sanitizeAddress(raw) {
   if (!raw) return "";
   if (raw.includes("=") && raw.includes("0x")) raw = raw.slice(raw.indexOf("0x"));
   return raw.trim().replace(/^"+|"+$/g, "").replace(/^'+|'+$/g, "");
 }
 
-const CONTRACT_ADDRESS = sanitizeAddress(process.env.CONTRACT_ADDRESS);
-if (!CONTRACT_ADDRESS) {
-  // do not throw here — getContract handles missing address later; but warn we don't have env var
-  console.error("NODE: CONTRACT_ADDRESS env not set or invalid (sanitized empty). Will attempt deployment.json.");
-}
-const provider = new (ethers.providers && ethers.providers.JsonRpcProvider ? ethers.providers.JsonRpcProvider : (ethers.JsonRpcProvider || ethers.getDefaultProvider))(process.env.SEPOLIA_RPC_URL);
-const signer = new ethers.Wallet(process.env.PRIVATE_KEY, provider);
+// Attempt to read CONTRACT_ADDRESS from env (sanitized) or from CONFIG
+const SANITIZED_ENV_CONTRACT = sanitizeAddress(process.env.CONTRACT_ADDRESS);
+const EFFECTIVE_CONTRACT_ADDR = SANITIZED_ENV_CONTRACT || CONFIG.CONTRACT_ADDRESS || null;
 
-// diagnostics go to stderr so stdout remains JSON for programmatic callers
-console.error("NODE: Using CONTRACT_ADDRESS:", CONTRACT_ADDRESS || CONFIG.CONTRACT_ADDRESS);
-console.error("NODE: Using signer addr:", signer.address);
+// Diagnostics to stderr only
+console.error("NODE: CONFIG.RPC_URL:", CONFIG.RPC_URL);
+console.error("NODE: Effective contract address (env/deployment):", EFFECTIVE_CONTRACT_ADDR);
+console.error("NODE: Using PRIVATE_KEY set:", !!process.env.PRIVATE_KEY);
 
-async function safeCreateSession(contract, sessionCode, classId, durationMinutes) {
-  // diagnostic on stderr
-  const balance = await signer.getBalance();
-  console.error("NODE: signer balance (wei):", balance.toString(), "ETH:", Number(balance)/1e18);
-
-  // estimate gas
-  let gasEstimate;
-  try {
-    gasEstimate = await contract.estimateGas.createSession(sessionCode, classId, durationMinutes, { from: signer.address });
-    console.error("NODE: gasEstimate:", gasEstimate.toString());
-  } catch (e) {
-    console.error("NODE: estimateGas failed:", e.message || e);
-  }
-
-  const feeData = await provider.getFeeData();
-  const defaultPriority = ethers.parseUnits ? ethers.parseUnits("1", "gwei") : (ethers.utils && ethers.utils.parseUnits ? ethers.utils.parseUnits("1", "gwei") : "1000000000");
-  const defaultMax = ethers.parseUnits ? ethers.parseUnits("2", "gwei") : (ethers.utils && ethers.utils.parseUnits ? ethers.utils.parseUnits("2", "gwei") : "2000000000");
-  const maxPriority = feeData.maxPriorityFeePerGas ?? defaultPriority;
-  const maxFee = feeData.maxFeePerGas ?? defaultMax;
-  const gasLimit = gasEstimate ? (gasEstimate * 12n / 10n) : 200000n;
-  const required = gasLimit * maxFee;
-  console.error("NODE: feeData:", {
-    maxFee: typeof maxFee === "bigint" ? maxFee.toString() : maxFee,
-    maxPriority: typeof maxPriority === "bigint" ? maxPriority.toString() : maxPriority,
-    gasLimit: gasLimit.toString(),
-    requiredWei: typeof required === "bigint" ? required.toString() : required,
-    requiredEth: (typeof required === "bigint") ? Number(required)/1e18 : (Number(required) / 1e18)
-  });
-
-  if (balance < required) {
-    throw new Error(`Insufficient funds: balance ${balance.toString()} < required ${required.toString()}`);
-  }
-
-  const tx = await contract.connect(signer).createSession(sessionCode, classId, durationMinutes, {
-    gasLimit,
-    maxPriorityFeePerGas: maxPriority,
-    maxFeePerGas: maxFee
-  });
-  console.error("NODE: tx hash", tx.hash);
-  const receipt = await tx.wait();
-  console.error("NODE: tx mined in block", receipt.blockNumber);
-  return receipt;
-}
-// === END helper ===
-
-module.exports = { safeCreateSession, CONTRACT_ADDRESS, provider, signer };
-
-// Contract ABI (minimal, for interaction)
+/**
+ * Contract ABI (minimal, for interaction)
+ */
 const CONTRACT_ABI = [
     "function createSession(string sessionCode, string classId, uint256 durationMinutes) external",
     "function markAttendance(string sessionCode, string studentId, string classId) external",
@@ -102,40 +58,55 @@ const CONTRACT_ABI = [
 
 /**
  * Get contract instance
+ * - reads deployment.json if necessary
+ * - constructs provider and wallet only here
  */
 async function getContract() {
     try {
-        // Read contract address from deployment file if not in env
-        let contractAddress = CONFIG.CONTRACT_ADDRESS;
-        
+        // Determine contract address (priority: sanitized env -> CONFIG -> deployment.json)
+        let contractAddress = EFFECTIVE_CONTRACT_ADDR || CONFIG.CONTRACT_ADDRESS;
+
         if (!contractAddress) {
             const deploymentPath = path.join(__dirname, 'deployment.json');
             if (fs.existsSync(deploymentPath)) {
-                const deployment = JSON.parse(fs.readFileSync(deploymentPath, 'utf8'));
-                contractAddress = deployment.contractAddress;
-                console.error("NODE: loaded contractAddress from deployment.json:", contractAddress);
+                try {
+                    const deployment = JSON.parse(fs.readFileSync(deploymentPath, 'utf8'));
+                    contractAddress = deployment.contractAddress || deployment.address || contractAddress;
+                    console.error("NODE: loaded contractAddress from deployment.json:", contractAddress);
+                } catch (e) {
+                    console.error("NODE: failed to parse deployment.json:", e && e.message ? e.message : e);
+                }
             }
         }
 
         if (!contractAddress) {
-            throw new Error('Contract address not found. Please deploy contract first.');
+            throw new Error('Contract address not found. Please set CONTRACT_ADDRESS env or provide deployment.json.');
         }
 
-        // Setup provider and signer
-        const provider = new ethers.JsonRpcProvider(CONFIG.RPC_URL);
+        // Setup provider and signer/wallet
+        const provider = new ethers.providers.JsonRpcProvider(CONFIG.RPC_URL);
         const wallet = new ethers.Wallet(CONFIG.PRIVATE_KEY, provider);
-        
-        // Create contract instance
+
+        console.error("NODE: provider ready, wallet address:", wallet.address);
+
+        // Create contract instance connected to wallet (so tx sending is simple)
         const contract = new ethers.Contract(contractAddress, CONTRACT_ABI, wallet);
-        
+        // defensive check
+        if (!contract || typeof contract.createSession !== 'function') {
+            throw new Error('Contract instance invalid or missing methods. Check ABI and contract address.');
+        }
+
         return { contract, provider, wallet };
     } catch (error) {
-        throw new Error(`Failed to initialize contract: ${error.message}`);
+        // rethrow with context
+        throw new Error(`Failed to initialize contract: ${error && error.message ? error.message : error}`);
     }
 }
 
 /**
- * Create attendance session
+ * Create attendance session (safe wrapper)
+ * Note: this returns tx.hash immediately (does NOT wait for mining) to avoid long HTTP waits.
+ * If you want to wait for mining, implement a separate background worker or change here intentionally.
  */
 async function createSession(payload) {
     const { sessionCode, classId, durationMinutes = 30 } = payload;
@@ -145,23 +116,30 @@ async function createSession(payload) {
     }
 
     const { contract } = await getContract();
-    
-    const tx = await contract.createSession(
-        sessionCode,
-        classId,
-        durationMinutes,
-        { gasLimit: CONFIG.GAS_LIMIT }
-    );
-    
-    const tx = await contract.createSession(sessionCode, classId, durationMinutes, { gasLimit: CONFIG.GAS_LIMIT });
-// immediately return tx hash — do not wait for mining
-return {
-  success: true,
-  txHash: tx.hash,
-  sessionCode,
-  classId,
-  message: "Transaction submitted — returned immediately. Confirmations may arrive later."
-};
+
+    if (!contract || typeof contract.createSession !== 'function') {
+        throw new Error('Contract not initialized or does not implement createSession');
+    }
+
+    try {
+        console.error("NODE: createSession -> calling contract.createSession", { sessionCode, classId, durationMinutes });
+        // submit tx and return tx.hash immediately — avoids waiting for mining in HTTP request
+        const tx = await contract.createSession(sessionCode, classId, durationMinutes, { gasLimit: CONFIG.GAS_LIMIT });
+        console.error("NODE: createSession -> tx submitted:", tx.hash);
+        return {
+            success: true,
+            txHash: tx.hash,
+            sessionCode,
+            classId,
+            message: "Transaction submitted (not awaited); confirm status asynchronously."
+        };
+    } catch (error) {
+        // log detailed error to stderr for debugging
+        console.error("NODE: createSession error:", error && error.stack ? error.stack : error);
+        // throw a structured error up so main() returns JSON to stdout that can be parsed
+        throw new Error(`createSession failed: ${error && error.message ? error.message : error}`);
+    }
+}
 
 /**
  * Mark attendance
@@ -174,36 +152,27 @@ async function markAttendance(payload) {
     }
 
     const { contract } = await getContract();
-    
-    // Check if session is valid
-    const isValid = await contract.isSessionValid(sessionCode);
-    if (!isValid) {
-        throw new Error('Session is invalid or expired');
+    if (!contract || typeof contract.markAttendance !== 'function') {
+        throw new Error('Contract not initialized or does not implement markAttendance');
     }
-    
-    // Check if already attended
-    const hasAttended = await contract.hasAttended(sessionCode, studentId);
-    if (hasAttended) {
-        throw new Error('Attendance already marked for this session');
+
+    try {
+        console.error("NODE: markAttendance -> calling contract.markAttendance", { sessionCode, studentId, classId });
+        const tx = await contract.markAttendance(sessionCode, studentId, classId, { gasLimit: CONFIG.GAS_LIMIT });
+        console.error("NODE: markAttendance -> tx submitted:", tx.hash);
+        return {
+            success: true,
+            txHash: tx.hash,
+            blockNumber: null,
+            sessionCode,
+            studentId,
+            timestamp: Date.now(),
+            message: "Transaction submitted (not awaited)"
+        };
+    } catch (error) {
+        console.error("NODE: markAttendance error:", error && error.stack ? error.stack : error);
+        throw new Error(`markAttendance failed: ${error && error.message ? error.message : error}`);
     }
-    
-    const tx = await contract.markAttendance(
-        sessionCode,
-        studentId,
-        classId,
-        { gasLimit: CONFIG.GAS_LIMIT }
-    );
-    
-    const receipt = await tx.wait();
-    
-    return {
-        success: true,
-        txHash: receipt.hash,
-        blockNumber: receipt.blockNumber,
-        sessionCode,
-        studentId,
-        timestamp: Date.now()
-    };
 }
 
 /**
@@ -215,12 +184,20 @@ async function isSessionValid(payload) {
         throw new Error('Missing required field: sessionCode');
     }
     const { contract } = await getContract();
-    const valid = await contract.isSessionValid(sessionCode);
-    return {
-        success: true,
-        sessionCode,
-        isValid: valid
-    };
+    if (!contract || typeof contract.isSessionValid !== 'function') {
+        throw new Error('Contract not initialized or does not implement isSessionValid');
+    }
+    try {
+        const valid = await contract.isSessionValid(sessionCode);
+        return {
+            success: true,
+            sessionCode,
+            isValid: valid
+        };
+    } catch (error) {
+        console.error("NODE: isSessionValid error:", error && error.stack ? error.stack : error);
+        throw new Error(`isSessionValid failed: ${error && error.message ? error.message : error}`);
+    }
 }
 
 /**
@@ -234,14 +211,22 @@ async function hasAttended(payload) {
     }
 
     const { contract } = await getContract();
-    const attended = await contract.hasAttended(sessionCode, studentId);
-    
-    return {
-        success: true,
-        sessionCode,
-        studentId,
-        hasAttended: attended
-    };
+    if (!contract || typeof contract.hasAttended !== 'function') {
+        throw new Error('Contract not initialized or does not implement hasAttended');
+    }
+
+    try {
+        const attended = await contract.hasAttended(sessionCode, studentId);
+        return {
+            success: true,
+            sessionCode,
+            studentId,
+            hasAttended: attended
+        };
+    } catch (error) {
+        console.error("NODE: hasAttended error:", error && error.stack ? error.stack : error);
+        throw new Error(`hasAttended failed: ${error && error.message ? error.message : error}`);
+    }
 }
 
 /**
@@ -255,19 +240,27 @@ async function getAttendanceRecord(payload) {
     }
 
     const { contract } = await getContract();
-    const record = await contract.getAttendanceRecord(sessionCode, studentId);
-    
-    return {
-        success: true,
-        record: {
-            sessionCode: record.sessionCode,
-            classId: record.classId,
-            studentId: record.studentId,
-            studentAddress: record.studentAddress,
-            timestamp: Number(record.timestamp),
-            verified: record.verified
-        }
-    };
+    if (!contract || typeof contract.getAttendanceRecord !== 'function') {
+        throw new Error('Contract not initialized or does not implement getAttendanceRecord');
+    }
+
+    try {
+        const record = await contract.getAttendanceRecord(sessionCode, studentId);
+        return {
+            success: true,
+            record: {
+                sessionCode: record.sessionCode,
+                classId: record.classId,
+                studentId: record.studentId,
+                studentAddress: record.studentAddress,
+                timestamp: Number(record.timestamp),
+                verified: record.verified
+            }
+        };
+    } catch (error) {
+        console.error("NODE: getAttendanceRecord error:", error && error.stack ? error.stack : error);
+        throw new Error(`getAttendanceRecord failed: ${error && error.message ? error.message : error}`);
+    }
 }
 
 /**
@@ -275,12 +268,19 @@ async function getAttendanceRecord(payload) {
  */
 async function getTotalRecords() {
     const { contract } = await getContract();
-    const total = await contract.getTotalRecords();
-    
-    return {
-        success: true,
-        totalRecords: Number(total)
-    };
+    if (!contract || typeof contract.getTotalRecords !== 'function') {
+        throw new Error('Contract not initialized or does not implement getTotalRecords');
+    }
+    try {
+        const total = await contract.getTotalRecords();
+        return {
+            success: true,
+            totalRecords: Number(total)
+        };
+    } catch (error) {
+        console.error("NODE: getTotalRecords error:", error && error.stack ? error.stack : error);
+        throw new Error(`getTotalRecords failed: ${error && error.message ? error.message : error}`);
+    }
 }
 
 /**
@@ -294,19 +294,27 @@ async function getRecordByIndex(payload) {
     }
 
     const { contract } = await getContract();
-    const record = await contract.getRecordByIndex(index);
-    
-    return {
-        success: true,
-        record: {
-            sessionCode: record.sessionCode,
-            classId: record.classId,
-            studentId: record.studentId,
-            studentAddress: record.studentAddress,
-            timestamp: Number(record.timestamp),
-            verified: record.verified
-        }
-    };
+    if (!contract || typeof contract.getRecordByIndex !== 'function') {
+        throw new Error('Contract not initialized or does not implement getRecordByIndex');
+    }
+
+    try {
+        const record = await contract.getRecordByIndex(index);
+        return {
+            success: true,
+            record: {
+                sessionCode: record.sessionCode,
+                classId: record.classId,
+                studentId: record.studentId,
+                studentAddress: record.studentAddress,
+                timestamp: Number(record.timestamp),
+                verified: record.verified
+            }
+        };
+    } catch (error) {
+        console.error("NODE: getRecordByIndex error:", error && error.stack ? error.stack : error);
+        throw new Error(`getRecordByIndex failed: ${error && error.message ? error.message : error}`);
+    }
 }
 
 /**
@@ -320,19 +328,22 @@ async function authorizeTeacher(payload) {
     }
 
     const { contract } = await getContract();
-    
-    const tx = await contract.authorizeTeacher(
-        teacherAddress,
-        { gasLimit: CONFIG.GAS_LIMIT }
-    );
-    
-    const receipt = await tx.wait();
-    
-    return {
-        success: true,
-        txHash: receipt.hash,
-        teacherAddress
-    };
+    if (!contract || typeof contract.authorizeTeacher !== 'function') {
+        throw new Error('Contract not initialized or does not implement authorizeTeacher');
+    }
+
+    try {
+        const tx = await contract.authorizeTeacher(teacherAddress, { gasLimit: CONFIG.GAS_LIMIT });
+        console.error("NODE: authorizeTeacher tx submitted:", tx.hash);
+        return {
+            success: true,
+            txHash: tx.hash,
+            teacherAddress
+        };
+    } catch (error) {
+        console.error("NODE: authorizeTeacher error:", error && error.stack ? error.stack : error);
+        throw new Error(`authorizeTeacher failed: ${error && error.message ? error.message : error}`);
+    }
 }
 
 /**
@@ -346,21 +357,23 @@ async function registerStudent(payload) {
     }
 
     const { contract } = await getContract();
-    
-    const tx = await contract.registerStudent(
-        studentId,
-        studentAddress,
-        { gasLimit: CONFIG.GAS_LIMIT }
-    );
-    
-    const receipt = await tx.wait();
-    
-    return {
-        success: true,
-        txHash: receipt.hash,
-        studentId,
-        studentAddress
-    };
+    if (!contract || typeof contract.registerStudent !== 'function') {
+        throw new Error('Contract not initialized or does not implement registerStudent');
+    }
+
+    try {
+        const tx = await contract.registerStudent(studentId, studentAddress, { gasLimit: CONFIG.GAS_LIMIT });
+        console.error("NODE: registerStudent tx submitted:", tx.hash);
+        return {
+            success: true,
+            txHash: tx.hash,
+            studentId,
+            studentAddress
+        };
+    } catch (error) {
+        console.error("NODE: registerStudent error:", error && error.stack ? error.stack : error);
+        throw new Error(`registerStudent failed: ${error && error.message ? error.message : error}`);
+    }
 }
 
 /**
@@ -415,13 +428,15 @@ async function main() {
         console.log(JSON.stringify(result));
         process.exit(0);
     } catch (error) {
-        // error details to stdout as JSON (so caller can parse error) and diagnostics to stderr
+        // diagnostics on stderr (stack), structured error JSON on stdout for caller parsing
         console.error("NODE ERROR:", error && error.stack ? error.stack : error);
-        console.log(JSON.stringify({
+        const errObj = {
             success: false,
-            error: error.message,
-            stack: error.stack
-        }));
+            error: error && error.message ? error.message : String(error),
+            stack: error && error.stack ? error.stack : null
+        };
+        // ensure stdout has something parseable
+        console.log(JSON.stringify(errObj));
         process.exit(1);
     }
 }
@@ -431,6 +446,7 @@ if (require.main === module) {
     main();
 }
 
+// Export functions for programmatic use
 module.exports = {
     createSession,
     markAttendance,
