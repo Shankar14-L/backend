@@ -4,6 +4,9 @@
  * Ethereum Runner Script
  * Handles blockchain interactions for the attendance system
  * Usage: node eth_runner.js <action> <json_payload>
+ *
+ * NOTE: diagnostics/logs are intentionally written to stderr so callers (like Python)
+ * can safely parse JSON printed to stdout.
  */
 
 const { ethers } = require('ethers');
@@ -19,8 +22,6 @@ const CONFIG = {
 };
 // === BEGIN: robust eth_runner helper ===
 
-
-
 function sanitizeAddress(raw) {
   if (!raw) return "";
   if (raw.includes("=") && raw.includes("0x")) raw = raw.slice(raw.indexOf("0x"));
@@ -28,40 +29,44 @@ function sanitizeAddress(raw) {
 }
 
 const CONTRACT_ADDRESS = sanitizeAddress(process.env.CONTRACT_ADDRESS);
-if (!CONTRACT_ADDRESS) throw new Error("CONTRACT_ADDRESS not set or invalid");
+if (!CONTRACT_ADDRESS) {
+  // do not throw here — getContract handles missing address later; but warn we don't have env var
+  console.error("NODE: CONTRACT_ADDRESS env not set or invalid (sanitized empty). Will attempt deployment.json.");
+}
 const provider = new (ethers.providers && ethers.providers.JsonRpcProvider ? ethers.providers.JsonRpcProvider : (ethers.JsonRpcProvider || ethers.getDefaultProvider))(process.env.SEPOLIA_RPC_URL);
 const signer = new ethers.Wallet(process.env.PRIVATE_KEY, provider);
 
-console.log("NODE: Using CONTRACT_ADDRESS:", CONTRACT_ADDRESS);
-console.log("NODE: Using signer addr:", signer.address);
+// diagnostics go to stderr so stdout remains JSON for programmatic callers
+console.error("NODE: Using CONTRACT_ADDRESS:", CONTRACT_ADDRESS || CONFIG.CONTRACT_ADDRESS);
+console.error("NODE: Using signer addr:", signer.address);
 
 async function safeCreateSession(contract, sessionCode, classId, durationMinutes) {
-  // diagnostic
+  // diagnostic on stderr
   const balance = await signer.getBalance();
-  console.log("NODE: signer balance (wei):", balance.toString(), "ETH:", Number(balance)/1e18);
+  console.error("NODE: signer balance (wei):", balance.toString(), "ETH:", Number(balance)/1e18);
 
   // estimate gas
   let gasEstimate;
   try {
     gasEstimate = await contract.estimateGas.createSession(sessionCode, classId, durationMinutes, { from: signer.address });
-    console.log("NODE: gasEstimate:", gasEstimate.toString());
+    console.error("NODE: gasEstimate:", gasEstimate.toString());
   } catch (e) {
-    console.warn("NODE: estimateGas failed:", e.message || e);
+    console.error("NODE: estimateGas failed:", e.message || e);
   }
 
   const feeData = await provider.getFeeData();
-  const defaultPriority = ethers.parseUnits("1", "gwei");
-  const defaultMax = ethers.parseUnits("2", "gwei");
+  const defaultPriority = ethers.parseUnits ? ethers.parseUnits("1", "gwei") : (ethers.utils && ethers.utils.parseUnits ? ethers.utils.parseUnits("1", "gwei") : "1000000000");
+  const defaultMax = ethers.parseUnits ? ethers.parseUnits("2", "gwei") : (ethers.utils && ethers.utils.parseUnits ? ethers.utils.parseUnits("2", "gwei") : "2000000000");
   const maxPriority = feeData.maxPriorityFeePerGas ?? defaultPriority;
   const maxFee = feeData.maxFeePerGas ?? defaultMax;
   const gasLimit = gasEstimate ? (gasEstimate * 12n / 10n) : 200000n;
   const required = gasLimit * maxFee;
-  console.log("NODE: feeData:", {
-    maxFee: maxFee.toString(),
-    maxPriority: maxPriority.toString(),
+  console.error("NODE: feeData:", {
+    maxFee: typeof maxFee === "bigint" ? maxFee.toString() : maxFee,
+    maxPriority: typeof maxPriority === "bigint" ? maxPriority.toString() : maxPriority,
     gasLimit: gasLimit.toString(),
-    requiredWei: required.toString(),
-    requiredEth: Number(required)/1e18
+    requiredWei: typeof required === "bigint" ? required.toString() : required,
+    requiredEth: (typeof required === "bigint") ? Number(required)/1e18 : (Number(required) / 1e18)
   });
 
   if (balance < required) {
@@ -73,9 +78,9 @@ async function safeCreateSession(contract, sessionCode, classId, durationMinutes
     maxPriorityFeePerGas: maxPriority,
     maxFeePerGas: maxFee
   });
-  console.log("NODE: tx hash", tx.hash);
+  console.error("NODE: tx hash", tx.hash);
   const receipt = await tx.wait();
-  console.log("NODE: tx mined in block", receipt.blockNumber);
+  console.error("NODE: tx mined in block", receipt.blockNumber);
   return receipt;
 }
 // === END helper ===
@@ -108,6 +113,7 @@ async function getContract() {
             if (fs.existsSync(deploymentPath)) {
                 const deployment = JSON.parse(fs.readFileSync(deploymentPath, 'utf8'));
                 contractAddress = deployment.contractAddress;
+                console.error("NODE: loaded contractAddress from deployment.json:", contractAddress);
             }
         }
 
@@ -406,10 +412,13 @@ async function main() {
                 throw new Error(`Unknown action: ${action}`);
         }
 
+        // final result must be JSON to stdout for caller
         console.log(JSON.stringify(result));
         process.exit(0);
     } catch (error) {
-        console.error(JSON.stringify({
+        // error details to stdout as JSON (so caller can parse error) and diagnostics to stderr
+        console.error("NODE ERROR:", error && error.stack ? error.stack : error);
+        console.log(JSON.stringify({
             success: false,
             error: error.message,
             stack: error.stack
