@@ -9,7 +9,7 @@
 const { ethers } = require('ethers');
 const fs = require('fs');
 const path = require('path');
-
+require("dotenv").config();
 // Configuration
 const CONFIG = {
     RPC_URL: process.env.ETH_RPC_URL || 'http://127.0.0.1:8545', // Local Hardhat/Ganache
@@ -17,6 +17,70 @@ const CONFIG = {
     CONTRACT_ADDRESS: process.env.CONTRACT_ADDRESS || null,
     GAS_LIMIT: process.env.GAS_LIMIT || 7000000
 };
+// === BEGIN: robust eth_runner helper ===
+
+
+
+function sanitizeAddress(raw) {
+  if (!raw) return "";
+  if (raw.includes("=") && raw.includes("0x")) raw = raw.slice(raw.indexOf("0x"));
+  return raw.trim().replace(/^"+|"+$/g, "").replace(/^'+|'+$/g, "");
+}
+
+const CONTRACT_ADDRESS = sanitizeAddress(process.env.CONTRACT_ADDRESS);
+if (!CONTRACT_ADDRESS) throw new Error("CONTRACT_ADDRESS not set or invalid");
+const provider = new (ethers.providers && ethers.providers.JsonRpcProvider ? ethers.providers.JsonRpcProvider : (ethers.JsonRpcProvider || ethers.getDefaultProvider))(process.env.SEPOLIA_RPC_URL);
+const signer = new ethers.Wallet(process.env.PRIVATE_KEY, provider);
+
+console.log("NODE: Using CONTRACT_ADDRESS:", CONTRACT_ADDRESS);
+console.log("NODE: Using signer addr:", signer.address);
+
+async function safeCreateSession(contract, sessionCode, classId, durationMinutes) {
+  // diagnostic
+  const balance = await signer.getBalance();
+  console.log("NODE: signer balance (wei):", balance.toString(), "ETH:", Number(balance)/1e18);
+
+  // estimate gas
+  let gasEstimate;
+  try {
+    gasEstimate = await contract.estimateGas.createSession(sessionCode, classId, durationMinutes, { from: signer.address });
+    console.log("NODE: gasEstimate:", gasEstimate.toString());
+  } catch (e) {
+    console.warn("NODE: estimateGas failed:", e.message || e);
+  }
+
+  const feeData = await provider.getFeeData();
+  const defaultPriority = ethers.parseUnits("1", "gwei");
+  const defaultMax = ethers.parseUnits("2", "gwei");
+  const maxPriority = feeData.maxPriorityFeePerGas ?? defaultPriority;
+  const maxFee = feeData.maxFeePerGas ?? defaultMax;
+  const gasLimit = gasEstimate ? (gasEstimate * 12n / 10n) : 200000n;
+  const required = gasLimit * maxFee;
+  console.log("NODE: feeData:", {
+    maxFee: maxFee.toString(),
+    maxPriority: maxPriority.toString(),
+    gasLimit: gasLimit.toString(),
+    requiredWei: required.toString(),
+    requiredEth: Number(required)/1e18
+  });
+
+  if (balance < required) {
+    throw new Error(`Insufficient funds: balance ${balance.toString()} < required ${required.toString()}`);
+  }
+
+  const tx = await contract.connect(signer).createSession(sessionCode, classId, durationMinutes, {
+    gasLimit,
+    maxPriorityFeePerGas: maxPriority,
+    maxFeePerGas: maxFee
+  });
+  console.log("NODE: tx hash", tx.hash);
+  const receipt = await tx.wait();
+  console.log("NODE: tx mined in block", receipt.blockNumber);
+  return receipt;
+}
+// === END helper ===
+
+module.exports = { safeCreateSession, CONTRACT_ADDRESS, provider, signer };
 
 // Contract ABI (minimal, for interaction)
 const CONTRACT_ABI = [
