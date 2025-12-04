@@ -226,9 +226,21 @@ async def get_from_ipfs(cid: str) -> Optional[dict]:
 
 
 # ==================== ETHEREUM INTEGRATION ====================
-async def call_node_eth(action, payload):
-    """Call Ethereum runner script (cross-platform, avoids asyncio.create_subprocess_exec on Windows)."""
+import asyncio
+import json
+import os
+import subprocess
+from pathlib import Path
+import logging
 
+logger = logging.getLogger("backend.server")
+
+async def call_node_eth(action, payload, runner_timeout: int = 60):
+    """Call Ethereum runner script (cross-platform). Returns parsed JSON from runner or None.
+
+    - Uses encoding='utf-8' and errors='replace' to avoid UnicodeDecodeError on Windows.
+    - If stdout contains multiple lines, attempts to parse the last JSON object found.
+    """
     possible_paths = [
         os.path.join(ROOT_DIR, "server", "eth_runner.js"),
         os.path.join(ROOT_DIR.parent, "server", "eth_runner.js"),
@@ -246,40 +258,83 @@ async def call_node_eth(action, payload):
         logger.warning("eth_runner.js not found (looked in %s)", possible_paths)
         return None
 
-    # Build the command
     cmd = ["node", runner_path, action, json.dumps(payload)]
 
     try:
-        # Run subprocess.run in a thread to avoid platform-specific asyncio subprocess issues
+        # Run the blocking subprocess.run in a thread
         result = await asyncio.to_thread(
             subprocess.run,
             cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            text=True,
-            check=False  # we"ll inspect returncode manually
+            text=True,                   # get text, not bytes
+            encoding="utf-8",            # decode with utf-8
+            errors="replace",            # replace undecodable bytes (prevents UnicodeDecodeError)
+            check=False,
+            timeout=runner_timeout
         )
 
         out_s = (result.stdout or "").strip()
         err_s = (result.stderr or "").strip()
 
-        if result.returncode == 0 and out_s:
-            try:
-                return json.loads(out_s)
-            except json.JSONDecodeError:
-                logger.exception("Ethereum runner returned non-JSON stdout: %s", out_s)
-                return None
+        logger.info("Ethereum runner exit code: %s", result.returncode)
+        if out_s:
+            logger.info("Ethereum runner stdout:\n%s", out_s)
+        if err_s:
+            # Keep stderr at warning level (useful while debugging)
+            logger.warning("Ethereum runner stderr:\n%s", err_s)
 
+        # If exit code non-zero -> return None (already logged)
         if result.returncode != 0:
-            logger.error("Ethereum runner exited with code %s. stderr: %s stdout: %s", result.returncode, err_s, out_s)
-        elif err_s:
-            logger.warning("Ethereum runner stderr (exit 0): %s", err_s)
+            logger.error("Ethereum runner exited with code %s", result.returncode)
+            return None
 
+        # result.returncode == 0 here. Try to extract JSON.
+        if not out_s:
+            logger.warning("Ethereum runner returned empty stdout with exit code 0")
+            return None
+
+        # Strategy: split stdout into lines and attempt to parse the last JSON object in it.
+        # This allows Node to print human-readable logs before/after the JSON payload.
+        last_json = None
+        for line in reversed(out_s.splitlines()):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                parsed = json.loads(line)
+                last_json = parsed
+                break
+            except json.JSONDecodeError:
+                # not a pure JSON line; continue searching earlier lines
+                continue
+
+        if last_json is not None:
+            return last_json
+
+        # Fallback: maybe stdout is a JSON blob with extra text around it.
+        # Try to locate the first '{' and last '}' and parse substring.
+        try:
+            first = out_s.find('{')
+            last = out_s.rfind('}')
+            if first != -1 and last != -1 and last > first:
+                candidate = out_s[first:last+1]
+                parsed = json.loads(candidate)
+                return parsed
+        except Exception:
+            logger.exception("Fallback JSON extraction failed")
+
+        # If we reach here, no JSON could be parsed.
+        logger.exception("Ethereum runner returned non-JSON stdout (exit 0). stdout: %s", out_s)
         return None
 
+    except subprocess.TimeoutExpired:
+        logger.exception("Ethereum runner timed out after %s seconds", runner_timeout)
+        return None
     except Exception:
         logger.exception("Ethereum call error while invoking eth_runner.js")
         return None
+
 
 # ==================== DATABASE SETUP ====================
 mongo_url = os.environ.get("MONGO_URL", "mongodb://localhost:27017")
@@ -400,6 +455,8 @@ class AttendanceRecord(BaseModel):
 
 class AttendanceMark(BaseModel):
     qr_content: str
+    latitude: float
+    longitude: float
 
 # ==================== AUTHENTICATION ====================
 async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)) -> dict:
@@ -548,6 +605,18 @@ async def get_teacher_stats(current_user: dict = Depends(get_current_user)):
 @api_router.post("/auth/register")
 async def register_user(user_data: RegisterRequest):
     """Register a new student and automatically log them in."""
+    
+    # Backend Validation for Email Suffix
+    if not user_data.email.endswith('@woxsen.edu.in'):
+        raise HTTPException(status_code=400, detail="Registration failed: Email must end with @woxsen.edu.in")
+
+    # Backend Validation for Roll Number Format (e.g., 23wu0101096)
+    # Pattern: YY[wW]u\d+ where YY is 23, 24, 25, etc.
+    import re
+    roll_no_regex = re.compile(r"^\d{2}[wW]u\d+$")
+    if not roll_no_regex.match(user_data.rollNo):
+        raise HTTPException(status_code=400, detail="Registration failed: Roll Number format is invalid. It should start with the year (e.g., 23) followed by 'wu' and then digits (e.g., 23wu0101096).")
+
     existing_user = await db.users.find_one({"email": user_data.email})
     if existing_user:
         raise HTTPException(status_code=400, detail="Email already registered")
@@ -774,8 +843,45 @@ async def get_my_attendance(current_user: dict = Depends(get_current_user)):
 
 @api_router.post("/attendance/mark")
 async def mark_attendance(attendance_data: AttendanceMark, current_user: dict = Depends(get_current_user)):
-    """Mark attendance using QR code"""
+    """Mark attendance using QR code and geolocation"""
     qr_content = attendance_data.qr_content
+    student_lat = attendance_data.latitude
+    student_lon = attendance_data.longitude
+
+    # --- Geolocation Check ---
+    # Define the fixed location of the class (e.g., Woxsen University main building)
+    # NOTE: This is a placeholder. In a real app, this should be fetched from the class record (cls)
+    # For now, we'll use a fixed coordinate for demonstration.
+    # Example Woxsen University coordinates (approximate): 17.6256, 78.2580
+    CLASS_LAT = 17.643916983623797
+    CLASS_LON = 77.79889463604464
+    MAX_DISTANCE_KM = 0.05 # 50 meters in kilometers (approx)
+
+    def haversine(lat1, lon1, lat2, lon2):
+        """Calculate the great-circle distance between two points on the Earth (in km)."""
+        from math import radians, sin, cos, sqrt, atan2
+        R = 6371 # Radius of Earth in kilometers
+
+        lat1, lon1, lat2, lon2 = map(radians, [lat1, lon1, lat2, lon2])
+
+        dlon = lon2 - lon1
+        dlat = lat2 - lat1
+
+        a = sin(dlat / 2)**2 + cos(lat1) * cos(lat2) * sin(dlon / 2)**2
+        c = 2 * atan2(sqrt(a), sqrt(1 - a))
+
+        return R * c
+
+    distance_km = haversine(CLASS_LAT, CLASS_LON, student_lat, student_lon)
+
+    if distance_km > MAX_DISTANCE_KM:
+        logger.warning("Attendance failed for %s: Distance %s km > %s km", current_user["email"], distance_km, MAX_DISTANCE_KM)
+        raise HTTPException(status_code=403, detail=f"Proximity check failed. You are {round(distance_km * 1000)} meters away. Must be within 50 meters of the class location.")
+    
+    logger.info("Proximity check passed for %s. Distance: %s meters", current_user["email"], round(distance_km * 1000))
+    # --- End Geolocation Check ---
+    
+    # Parse QR content
     
     # Parse QR content
     try:
