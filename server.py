@@ -853,8 +853,8 @@ async def mark_attendance(attendance_data: AttendanceMark, current_user: dict = 
     # NOTE: This is a placeholder. In a real app, this should be fetched from the class record (cls)
     # For now, we'll use a fixed coordinate for demonstration.
     # Example Woxsen University coordinates (approximate): 17.6256, 78.2580
-    CLASS_LAT = 17.643916983623797
-    CLASS_LON = 77.79889463604464
+    CLASS_LAT =17.643857599748323
+    CLASS_LON =77.79888156463137
     MAX_DISTANCE_KM = 0.05 # 50 meters in kilometers (approx)
 
     def haversine(lat1, lon1, lat2, lon2):
