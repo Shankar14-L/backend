@@ -855,7 +855,7 @@ async def mark_attendance(attendance_data: AttendanceMark, current_user: dict = 
     # Example Woxsen University coordinates (approximate): 17.6256, 78.2580
     CLASS_LAT =17.643857599748323
     CLASS_LON =77.79888156463137
-    MAX_DISTANCE_KM = 0.05 # 50 meters in kilometers (approx)
+    MAX_DISTANCE_KM = 0.55 # 50 meters in kilometers (approx)
 
     def haversine(lat1, lon1, lat2, lon2):
         """Calculate the great-circle distance between two points on the Earth (in km)."""
