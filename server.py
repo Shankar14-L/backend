@@ -98,7 +98,7 @@ async def upload_to_ipfs(data: dict) -> Optional[str]:
 
         async with httpx.AsyncClient(timeout=30.0) as client:
             # 1) Try Pinata if configured
-            pinata_jwt = os.environ.get("PINATA_JWT")
+            pinata_jwt = os.environ.get("SECRET_KEY")
             if pinata_jwt:
                 try:
                     resp = await client.post(
