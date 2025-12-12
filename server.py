@@ -1109,7 +1109,7 @@ app.include_router(api_router)
 
 # Simple in-memory rate limiter
 RATE_LIMIT_WINDOW = 60  # seconds
-RATE_LIMIT_MAX_REQUESTS = 10  # max requests per window
+RATE_LIMIT_MAX_REQUESTS = 200  # max requests per window
 rate_limit_store = defaultdict(lambda: {"count": 0, "reset_time": 0})
 
 class RateLimitMiddleware(BaseHTTPMiddleware):
