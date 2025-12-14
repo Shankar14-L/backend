@@ -98,7 +98,7 @@ async def upload_to_ipfs(data: dict) -> Optional[str]:
 
         async with httpx.AsyncClient(timeout=30.0) as client:
             # 1) Try Pinata if configured
-            pinata_jwt = os.environ.get("SECRET_KEY")
+            pinata_jwt = os.environ.get("PINATA_JWT")
             if pinata_jwt:
                 try:
                     resp = await client.post(
@@ -853,9 +853,9 @@ async def mark_attendance(attendance_data: AttendanceMark, current_user: dict = 
     # NOTE: This is a placeholder. In a real app, this should be fetched from the class record (cls)
     # For now, we'll use a fixed coordinate for demonstration.
     # Example Woxsen University coordinates (approximate): 17.6256, 78.2580
-    CLASS_LAT = 17.646603364686797
-    CLASS_LON = 77.79983372824238
-    MAX_DISTANCE_KM = 0.500 # 50 meters in kilometers (approx)
+    CLASS_LAT = 17.646877957671276
+    CLASS_LON = 77.79990451193868
+    MAX_DISTANCE_KM = 0.50 # 50 meters in kilometers (approx)
 
     def haversine(lat1, lon1, lat2, lon2):
         """Calculate the great-circle distance between two points on the Earth (in km)."""
