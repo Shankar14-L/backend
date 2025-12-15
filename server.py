@@ -1079,7 +1079,7 @@ async def export_class_attendance_csv(class_id: str, current_user: dict = Depend
         
         name = student.get("name", "N/A")
         # Assuming 'rollNumber' is stored in the user profile, falling back to student_id
-        roll_number = student.get("rollNumber") or student.get("student_id", "N/A")
+        roll_number = student.get("rollNo") or student.get("student_id", "N/A")
         email = student.get("email", "N/A")
         timestamp = record.get("timestamp").isoformat() if record.get("timestamp") else "N/A"
         blockchain_hash = record.get("blockchain_hash", "N/A")
